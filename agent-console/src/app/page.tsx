@@ -1,5 +1,6 @@
 'use client';
 
+import { useRef, useCallback } from 'react';
 import { useAgentWebSocket } from '@/lib/useAgentWebSocket';
 import { ChatPanel } from '@/components/ChatPanel';
 import { TimelinePanel } from '@/components/TimelinePanel';
@@ -20,6 +21,21 @@ export default function Home() {
     setHighlightElementId,
   } = useAgentWebSocket();
 
+  const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const flashHighlight = useCallback((id: string | null) => {
+    if (highlightTimerRef.current) {
+      clearTimeout(highlightTimerRef.current);
+    }
+    setHighlightElementId(id);
+    if (id) {
+      highlightTimerRef.current = setTimeout(() => {
+        setHighlightElementId(null);
+        highlightTimerRef.current = null;
+      }, 2000);
+    }
+  }, [setHighlightElementId]);
+
   return (
     <div className="flex h-screen bg-gray-900 text-white relative">
       <ConnectionStatus status={connectionStatus} />
@@ -33,8 +49,7 @@ export default function Home() {
           onToolCardClick={(seq) => {
             const id = `TOOL_CALL-${seq}`;
             setSelectedTimelineId(id);
-            setHighlightElementId(id);
-            setTimeout(() => setHighlightElementId(null), 2000);
+            flashHighlight(id);
           }}
           highlightElementId={highlightElementId}
         />
@@ -46,10 +61,7 @@ export default function Home() {
           selectedId={selectedTimelineId}
           onSelect={(id) => {
             setSelectedTimelineId(id);
-            if (id) {
-              setHighlightElementId(id);
-              setTimeout(() => setHighlightElementId(null), 2000);
-            }
+            flashHighlight(id);
           }}
         />
       </div>

@@ -9,6 +9,8 @@ export type ServerMessageType =
 
 export type ClientMessageType = 'USER_MESSAGE' | 'PONG' | 'RESUME' | 'TOOL_ACK';
 
+export type ConnectionStatus = 'connecting' | 'connected' | 'disconnected' | 'reconnecting';
+
 export interface ServerMessage {
   type: ServerMessageType;
   seq: number;
@@ -42,17 +44,13 @@ export interface ToolCall {
   result?: unknown;
 }
 
-export interface TextChunk {
-  id: string;
-  text: string;
-  stream_id: string;
-  beforeToolCallSeq?: number;
-}
+export type StreamBlock =
+  | { kind: 'text'; id: string; text: string; stream_id: string }
+  | { kind: 'tool-call'; id: string; call: ToolCall };
 
 export interface StreamState {
   stream_id: string;
-  chunks: TextChunk[];
-  toolCalls: ToolCall[];
+  blocks: StreamBlock[];
   isComplete: boolean;
 }
 
@@ -63,6 +61,8 @@ export interface TimelineEvent {
   content: string;
   timestamp: number;
   data?: unknown;
+  call_id?: string;
+  stream_id?: string;
 }
 
 export interface TokenBatch {

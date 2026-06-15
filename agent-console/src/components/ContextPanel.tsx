@@ -1,10 +1,8 @@
 'use client';
 
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useCallback, memo } from 'react';
 import type { ContextSnapshot, ContextDiff } from '@/lib/types';
 import { computeContextDiff } from '@/lib/contextDiff';
-
-const LARGE_OBJECT_THRESHOLD = 50;
 
 interface ContextPanelProps {
   contexts: ContextSnapshot[];
@@ -12,6 +10,7 @@ interface ContextPanelProps {
 
 export function ContextPanel({ contexts }: ContextPanelProps) {
   const [selectedIdx, setSelectedIdx] = useState<number>(-1);
+  const [collapsedPaths, setCollapsedPaths] = useState<Set<string>>(new Set());
 
   const groupedContexts = useMemo(() => {
     const groups = new Map<string, ContextSnapshot[]>();
@@ -44,16 +43,36 @@ export function ContextPanel({ contexts }: ContextPanelProps) {
     return computeContextDiff(prevSnapshot.data, currentContext.data);
   }, [currentContext, groupedContexts]);
 
-  const isLargeObject = useMemo(() => {
-    if (!currentContext?.data) return false;
-    const str = JSON.stringify(currentContext.data);
-    return str.length > LARGE_OBJECT_THRESHOLD;
+  const toggleCollapse = useCallback((path: string) => {
+    setCollapsedPaths((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) {
+        next.delete(path);
+      } else {
+        next.add(path);
+      }
+      return next;
+    });
+  }, []);
+
+  const snapshotSize = useMemo(() => {
+    if (!currentContext?.data) return 0;
+    try {
+      return new Blob([JSON.stringify(currentContext.data)]).size;
+    } catch {
+      return -1;
+    }
   }, [currentContext]);
 
   return (
     <div className="flex flex-col h-full">
-      <div className="p-3 border-b border-gray-700 font-medium text-gray-300">
-        Context Inspector
+      <div className="p-3 border-b border-gray-700 font-medium text-gray-300 flex items-center justify-between">
+        <span>Context Inspector</span>
+        {snapshotSize > 0 && (
+          <span className="text-[10px] text-gray-500 font-mono">
+            {(snapshotSize / 1024).toFixed(1)}KB
+          </span>
+        )}
       </div>
 
       {contexts.length === 0 ? (
@@ -106,12 +125,15 @@ export function ContextPanel({ contexts }: ContextPanelProps) {
             </div>
           )}
 
-          <div className="text-xs bg-gray-800 rounded p-3 overflow-x-auto max-h-[60vh] overflow-y-auto">
+          <div className="text-xs bg-gray-800 rounded overflow-hidden">
             {currentContext && (
-              <JsonTree
+              <LazyJsonTree
                 data={currentContext.data}
                 diff={diff}
-                defaultCollapsed={isLargeObject}
+                path="root"
+                collapsedPaths={collapsedPaths}
+                onToggle={toggleCollapse}
+                depth={0}
               />
             )}
           </div>
@@ -121,24 +143,40 @@ export function ContextPanel({ contexts }: ContextPanelProps) {
   );
 }
 
-interface JsonTreeProps {
+interface LazyJsonTreeProps {
   data: unknown;
   diff?: ContextDiff | null;
-  depth?: number;
-  defaultCollapsed?: boolean;
+  path: string;
+  collapsedPaths: Set<string>;
+  onToggle: (path: string) => void;
+  depth: number;
 }
 
-function JsonTree({ data, diff, depth = 0, defaultCollapsed = false }: JsonTreeProps) {
-  const [collapsed, setCollapsed] = useState(defaultCollapsed);
+const MAX_INLINE_LENGTH = 80;
+const MAX_INITIAL_ITEMS = 100;
+
+const LazyJsonTree = memo(function LazyJsonTree({
+  data,
+  diff,
+  path,
+  collapsedPaths,
+  onToggle,
+  depth,
+}: LazyJsonTreeProps) {
+  const isCollapsed = collapsedPaths.has(path);
 
   if (data === null || data === undefined) {
     return <span className="text-gray-500">null</span>;
   }
 
   if (typeof data !== 'object') {
+    const str =
+      typeof data === 'string'
+        ? `"${data.length > MAX_INLINE_LENGTH ? data.slice(0, MAX_INLINE_LENGTH) + '...' : data}"`
+        : String(data);
     return (
       <span className={typeof data === 'string' ? 'text-green-300' : 'text-blue-300'}>
-        {typeof data === 'string' ? `"${data}"` : String(data)}
+        {str}
       </span>
     );
   }
@@ -146,10 +184,10 @@ function JsonTree({ data, diff, depth = 0, defaultCollapsed = false }: JsonTreeP
   if (Array.isArray(data)) {
     if (data.length === 0) return <span className="text-gray-500">[]</span>;
 
-    if (collapsed && depth > 0) {
+    if (isCollapsed) {
       return (
         <span
-          onClick={() => setCollapsed(false)}
+          onClick={() => onToggle(path)}
           className="cursor-pointer text-gray-400 hover:text-gray-200"
         >
           Array({data.length}) [...]
@@ -157,22 +195,32 @@ function JsonTree({ data, diff, depth = 0, defaultCollapsed = false }: JsonTreeP
       );
     }
 
+    const items = data.slice(0, MAX_INITIAL_ITEMS);
+
     return (
       <div>
-        <span className="text-gray-500 cursor-pointer" onClick={() => setCollapsed(!collapsed)}>
-          {collapsed ? `Array(${data.length}) [>]` : '['}
+        <span className="text-gray-500 cursor-pointer" onClick={() => onToggle(path)}>
+          [<span className="text-gray-600 ml-1">{data.length} items</span>
         </span>
-        {!collapsed && (
-          <>
-            {data.map((item, i) => (
-              <div key={i} style={{ paddingLeft: 12 }}>
-                <JsonTree data={item} diff={diff} depth={depth + 1} defaultCollapsed={defaultCollapsed} />
-                {i < data.length - 1 && <span className="text-gray-500">,</span>}
-              </div>
-            ))}
-            <span className="text-gray-500">]</span>
-          </>
+        {items.map((item, i) => (
+          <div key={i} style={{ paddingLeft: 12 }}>
+            <LazyJsonTree
+              data={item}
+              diff={diff}
+              path={`${path}[${i}]`}
+              collapsedPaths={collapsedPaths}
+              onToggle={onToggle}
+              depth={depth + 1}
+            />
+            {i < items.length - 1 && <span className="text-gray-500">,</span>}
+          </div>
+        ))}
+        {data.length > MAX_INITIAL_ITEMS && (
+          <div style={{ paddingLeft: 12 }} className="text-gray-600">
+            ...{data.length - MAX_INITIAL_ITEMS} more items
+          </div>
         )}
+        <span className="text-gray-500">]</span>
       </div>
     );
   }
@@ -181,10 +229,10 @@ function JsonTree({ data, diff, depth = 0, defaultCollapsed = false }: JsonTreeP
   const keys = Object.keys(obj);
   if (keys.length === 0) return <span className="text-gray-500">{'{}'}</span>;
 
-  if (collapsed && depth > 0) {
+  if (isCollapsed) {
     return (
       <span
-        onClick={() => setCollapsed(false)}
+        onClick={() => onToggle(path)}
         className="cursor-pointer text-gray-400 hover:text-gray-200"
       >
         {'{...}'} ({keys.length} keys)
@@ -192,33 +240,44 @@ function JsonTree({ data, diff, depth = 0, defaultCollapsed = false }: JsonTreeP
     );
   }
 
+  const displayKeys = keys.slice(0, MAX_INITIAL_ITEMS);
+
   return (
     <div>
-      <span className="text-gray-500 cursor-pointer" onClick={() => setCollapsed(!collapsed)}>
-        {collapsed ? `{>}` : '{'}
+      <span className="text-gray-500 cursor-pointer" onClick={() => onToggle(path)}>
+        {'{'}
+        <span className="text-gray-600 ml-1">{keys.length} keys</span>
       </span>
-      {!collapsed && (
-        <>
-          {keys.map((key, i) => {
-            let highlightClass = '';
-            if (diff) {
-              if (diff.added.includes(key)) highlightClass = 'bg-green-900/30';
-              else if (diff.changed.includes(key)) highlightClass = 'bg-yellow-900/30';
-              else if (diff.removed.includes(key)) highlightClass = 'bg-red-900/30';
-            }
+      {displayKeys.map((key, i) => {
+        let highlightClass = '';
+        if (diff) {
+          if (diff.added.includes(key)) highlightClass = 'bg-green-900/30';
+          else if (diff.changed.includes(key)) highlightClass = 'bg-yellow-900/30';
+          else if (diff.removed.includes(key)) highlightClass = 'bg-red-900/30';
+        }
 
-            return (
-              <div key={key} style={{ paddingLeft: 12 }} className={highlightClass}>
-                <span className="text-purple-300">&quot;{key}&quot;</span>
-                <span className="text-gray-500">: </span>
-                <JsonTree data={obj[key]} diff={diff} depth={depth + 1} defaultCollapsed={defaultCollapsed} />
-                {i < keys.length - 1 && <span className="text-gray-500">,</span>}
-              </div>
-            );
-          })}
-          <span className="text-gray-500">{'}'}</span>
-        </>
+        return (
+          <div key={key} style={{ paddingLeft: 12 }} className={highlightClass}>
+            <span className="text-purple-300">&quot;{key}&quot;</span>
+            <span className="text-gray-500">: </span>
+            <LazyJsonTree
+              data={obj[key]}
+              diff={diff}
+              path={`${path}.${key}`}
+              collapsedPaths={collapsedPaths}
+              onToggle={onToggle}
+              depth={depth + 1}
+            />
+            {i < keys.length - 1 && <span className="text-gray-500">,</span>}
+          </div>
+        );
+      })}
+      {keys.length > MAX_INITIAL_ITEMS && (
+        <div style={{ paddingLeft: 12 }} className="text-gray-600">
+          ...{keys.length - MAX_INITIAL_ITEMS} more keys
+        </div>
       )}
+      <span className="text-gray-500">{'}'}</span>
     </div>
   );
-}
+});

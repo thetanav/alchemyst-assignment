@@ -59,83 +59,56 @@ export function ChatPanel({
     }
   };
 
-  const renderAgentContent = (msg: ChatMessage) => {
-    if (!msg.streamId) return null;
-    const stream = streams.get(msg.streamId);
-    if (!stream) return null;
+  const renderBlocks = useCallback(
+    (stream: StreamState): React.ReactNode[] => {
+      const nodes: React.ReactNode[] = [];
 
-    const elements: React.ReactNode[] = [];
-    let textAccumulator = '';
-
-    const flushText = (key: string) => {
-      if (textAccumulator) {
-        elements.push(
-          <div
-            key={key}
-            className="bg-gray-800 rounded-lg p-3"
-          >
-            <div className="text-gray-300 whitespace-pre-wrap text-sm">{textAccumulator}</div>
-          </div>
-        );
-        textAccumulator = '';
-      }
-    };
-
-    for (const chunk of stream.chunks) {
-      textAccumulator += chunk.text;
-
-      if (chunk.beforeToolCallSeq) {
-        flushText(`chunk-${chunk.id}`);
-
-        const matchingCalls = stream.toolCalls.filter(
-          (tc) => tc.seq === chunk.beforeToolCallSeq
-        );
-
-        for (const tc of matchingCalls) {
-          const elementId = `TOOL_CALL-${tc.seq}`;
-          elements.push(
+      for (const block of stream.blocks) {
+        if (block.kind === 'text') {
+          if (block.text) {
+            nodes.push(
+              <div
+                key={block.id}
+                data-element-id={`TOKEN-${stream.stream_id}-${block.id}`}
+                className="bg-gray-800 rounded-lg p-3"
+              >
+                <div className="text-gray-300 whitespace-pre-wrap text-sm">
+                  {block.text}
+                </div>
+              </div>
+            );
+          }
+        } else {
+          const elementId = `TOOL_CALL-${block.call.seq}`;
+          nodes.push(
             <div
-              key={`tc-wrapper-${tc.call_id}`}
+              key={block.id}
               ref={(el) => setElementRef(elementId, el)}
               data-element-id={elementId}
             >
               <ToolCallCard
-                toolCall={tc}
-                isSelected={selectedTimelineId === `TOOL_CALL-${tc.seq}`}
-                onClick={() => onToolCardClick(tc.seq)}
+                toolCall={block.call}
+                isSelected={selectedTimelineId === `TOOL_CALL-${block.call.seq}`}
+                onClick={() => onToolCardClick(block.call.seq)}
               />
             </div>
           );
         }
       }
-    }
 
-    flushText(`final-${msg.streamId}`);
-
-    if (stream.toolCalls.length > 0) {
-      const toolCallsWithoutChunks = stream.toolCalls.filter(
-        (tc) => !stream.chunks.some((ch) => ch.beforeToolCallSeq === tc.seq)
-      );
-      for (const tc of toolCallsWithoutChunks) {
-        const elementId = `TOOL_CALL-${tc.seq}`;
-        elements.push(
-          <div
-            key={`tc-wrapper-orphan-${tc.call_id}`}
-            ref={(el) => setElementRef(elementId, el)}
-            data-element-id={elementId}
-          >
-            <ToolCallCard
-              toolCall={tc}
-              isSelected={selectedTimelineId === `TOOL_CALL-${tc.seq}`}
-              onClick={() => onToolCardClick(tc.seq)}
-            />
+      if (!stream.isComplete && stream.blocks.length === 0) {
+        nodes.push(
+          <div key="waiting" className="flex items-center gap-2 text-gray-500 text-sm p-2">
+            <div className="w-2 h-2 bg-blue-400 rounded-full animate-pulse" />
+            Agent is thinking...
           </div>
         );
       }
-    }
 
-    return elements;
-  };
+      return nodes;
+    },
+    [selectedTimelineId, onToolCardClick, setElementRef]
+  );
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
@@ -152,12 +125,25 @@ export function ChatPanel({
             className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
           >
             {msg.role === 'user' ? (
-              <div className="bg-blue-600 rounded-lg px-4 py-2 max-w-[70%]" data-element-id={`USER_MESSAGE-${msg.id}`}>
-                <div className="text-white text-sm whitespace-pre-wrap">{msg.content}</div>
+              <div
+                className="bg-blue-600 rounded-lg px-4 py-2 max-w-[70%]"
+                data-element-id={`USER_MESSAGE-${msg.id}`}
+              >
+                <div className="text-white text-sm whitespace-pre-wrap">
+                  {msg.content}
+                </div>
               </div>
             ) : (
               <div className="space-y-2 max-w-[85%] min-w-0">
-                {renderAgentContent(msg)}
+                {msg.streamId && (() => {
+                  const stream = streams.get(msg.streamId);
+                  if (!stream) return (
+                    <div key="no-stream" className="text-gray-500 text-sm p-2">
+                      Waiting for response...
+                    </div>
+                  );
+                  return renderBlocks(stream);
+                })()}
               </div>
             )}
           </div>

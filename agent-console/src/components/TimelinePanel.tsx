@@ -157,6 +157,9 @@ export function TimelinePanel({ events, selectedId, onSelect }: TimelinePanelPro
           const isToolCall = singleEvent.type === 'TOOL_CALL';
           const isToolResult = singleEvent.type === 'TOOL_RESULT';
 
+          const linkedCallId = singleEvent.call_id;
+          const isLinked = linkedCallId && (isToolCall || isToolResult);
+
           return (
             <div
               key={singleEvent.id}
@@ -165,19 +168,31 @@ export function TimelinePanel({ events, selectedId, onSelect }: TimelinePanelPro
               data-element-id={`${singleEvent.type}-${singleEvent.seq}`}
               className={`px-3 py-2 border-b border-gray-800 cursor-pointer hover:bg-gray-800 transition-colors ${
                 isSelected ? 'bg-gray-700' : ''
-              } ${isToolResult ? 'ml-4 border-l-2 border-green-700' : ''} ${
+              } ${
                 isToolCall ? 'border-l-2 border-yellow-700' : ''
+              } ${
+                isToolResult ? 'border-l-2 border-green-700' : ''
               }`}
             >
               <div className="flex items-center gap-2">
                 <EventBadge type={singleEvent.type} />
-                {singleEvent.seq !== undefined && (
+                {singleEvent.seq !== undefined && singleEvent.seq >= 0 && (
                   <span className="text-xs text-gray-500 font-mono">#{singleEvent.seq}</span>
+                )}
+                {isLinked && (
+                  <span className="text-[9px] text-gray-600 font-mono ml-auto">
+                    {linkedCallId}
+                  </span>
                 )}
               </div>
               <div className="text-xs text-gray-400 mt-1 truncate">
                 {singleEvent.content}
               </div>
+              {isToolResult && (
+                <div className="mt-1 ml-2 border-l-2 border-green-800/50 pl-2 text-[10px] text-gray-600">
+                  Linked to {isToolCall ? '' : 'call'} {linkedCallId}
+                </div>
+              )}
             </div>
           );
         })}

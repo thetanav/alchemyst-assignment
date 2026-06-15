@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { SequenceBuffer } from './sequence-buffer';
 import type {
   ServerMessage,
   ClientMessage,
@@ -8,13 +9,14 @@ import type {
   TimelineEvent,
   ContextSnapshot,
   ChatMessage,
+  ConnectionStatus,
+  StreamBlock,
+  ToolCall,
 } from './types';
 
 const WS_URL = 'ws://localhost:4747/ws';
 const MAX_RECONNECT_DELAY = 10000;
 const INITIAL_RECONNECT_DELAY = 500;
-
-type ConnectionStatus = 'connecting' | 'connected' | 'disconnected' | 'reconnecting';
 
 export interface UseAgentWebSocketReturn {
   streams: Map<string, StreamState>;
@@ -29,14 +31,18 @@ export interface UseAgentWebSocketReturn {
   setHighlightElementId: (id: string | null) => void;
 }
 
+let localIdCounter = 0;
+function timelineId(type: string, seq?: number, suffix?: string): string {
+  return `${type}-${seq ?? `local-${++localIdCounter}`}${suffix ? '-' + suffix : ''}`;
+}
+
 export function useAgentWebSocket(): UseAgentWebSocketReturn {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectDelayRef = useRef(INITIAL_RECONNECT_DELAY);
-  const reconnectTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const lastProcessedSeqRef = useRef(0);
-  const processedSeqsRef = useRef(new Set<number>());
-  const reorderBufferRef = useRef(new Map<number, ServerMessage>());
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isFirstConnectRef = useRef(true);
+  const seqBufRef = useRef(new SequenceBuffer());
+  const domConsumedSeqRef = useRef(0);
 
   const [streams, setStreams] = useState<Map<string, StreamState>>(new Map());
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -52,7 +58,7 @@ export function useAgentWebSocket(): UseAgentWebSocketReturn {
         ...prev,
         {
           ...event,
-          id: `${event.type}-${event.seq ?? Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          id: timelineId(event.type, event.seq),
           timestamp: Date.now(),
         },
       ]);
@@ -65,7 +71,7 @@ export function useAgentWebSocket(): UseAgentWebSocketReturn {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
         const msg: ClientMessage = { type: 'PONG', echo: challenge };
         wsRef.current.send(JSON.stringify(msg));
-        addTimelineEvent({ type: 'PONG', content: `Echoed: ${challenge}` });
+        addTimelineEvent({ type: 'PONG', content: `Echoed: ${JSON.stringify(challenge)}` });
       }
     },
     [addTimelineEvent]
@@ -76,7 +82,7 @@ export function useAgentWebSocket(): UseAgentWebSocketReturn {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
         const msg: ClientMessage = { type: 'TOOL_ACK', call_id: callId };
         wsRef.current.send(JSON.stringify(msg));
-        addTimelineEvent({ type: 'TOOL_ACK', content: `Acknowledged: ${callId}` });
+        addTimelineEvent({ type: 'TOOL_ACK', content: `Acknowledged: ${callId}`, call_id: callId });
       }
     },
     [addTimelineEvent]
@@ -103,225 +109,201 @@ export function useAgentWebSocket(): UseAgentWebSocketReturn {
     }
   }
 
-  const processMessage = useCallback(
-    (msg: ServerMessage) => {
-      if (msg.seq !== undefined && processedSeqsRef.current.has(msg.seq)) {
-        return;
-      }
-      if (msg.seq !== undefined) {
-        processedSeqsRef.current.add(msg.seq);
-        if (msg.seq > lastProcessedSeqRef.current) {
-          lastProcessedSeqRef.current = msg.seq;
-        }
-      }
+  const processMessages = useCallback(
+    (msgs: ServerMessage[]) => {
+      for (const msg of msgs) {
+        addTimelineEvent({
+          type: msg.type,
+          seq: msg.seq,
+          content: getEventContent(msg),
+          data: msg,
+          call_id: msg.call_id,
+          stream_id: msg.stream_id,
+        });
 
-      addTimelineEvent({
-        type: msg.type,
-        seq: msg.seq,
-        content: getEventContent(msg),
-        data: msg,
-      });
-
-      switch (msg.type) {
-        case 'TOKEN': {
-          const streamId = msg.stream_id || 'default';
-          setStreams((prev) => {
-            const next = new Map(prev);
-            const existing = next.get(streamId) || {
-              stream_id: streamId,
-              chunks: [{ id: `chunk-init-${streamId}`, text: '', stream_id: streamId }],
-              toolCalls: [],
-              isComplete: false,
-            };
-            const updatedChunks = [...existing.chunks];
-            const lastIdx = updatedChunks.length - 1;
-            updatedChunks[lastIdx] = {
-              ...updatedChunks[lastIdx],
-              text: updatedChunks[lastIdx].text + (msg.text || ''),
-            };
-            next.set(streamId, { ...existing, chunks: updatedChunks });
-            return next;
-          });
-
-          setMessages((prev) => {
+        switch (msg.type) {
+          case 'TOKEN': {
             const streamId = msg.stream_id || 'default';
-            const existing = prev.find((m) => m.streamId === streamId && m.role === 'agent');
-            if (existing) {
-              return prev.map((m) =>
-                m.id === existing.id ? { ...m, content: m.content + (msg.text || '') } : m
+            const text = msg.text || '';
+            setStreams((prev) => {
+              const next = new Map(prev);
+              const existing = next.get(streamId) || {
+                stream_id: streamId,
+                blocks: [],
+                isComplete: false,
+              };
+              const blocks = [...existing.blocks];
+              const lastBlock = blocks[blocks.length - 1];
+              if (lastBlock && lastBlock.kind === 'text') {
+                blocks[blocks.length - 1] = {
+                  kind: 'text',
+                  id: lastBlock.id,
+                  text: lastBlock.text + text,
+                  stream_id: streamId,
+                };
+              } else {
+                blocks.push({
+                  kind: 'text',
+                  id: `text-${streamId}-${blocks.length}`,
+                  text,
+                  stream_id: streamId,
+                });
+              }
+              next.set(streamId, { ...existing, blocks });
+              return next;
+            });
+
+            setMessages((prev) => {
+              const existing = prev.find(
+                (m) => m.streamId === streamId && m.role === 'agent'
               );
-            }
-            return [
+              if (existing) {
+                return prev.map((m) =>
+                  m.id === existing.id
+                    ? { ...m, content: m.content + text }
+                    : m
+                );
+              }
+              return [
+                ...prev,
+                {
+                  id: `agent-${streamId}`,
+                  role: 'agent' as const,
+                  content: text,
+                  streamId,
+                  timestamp: Date.now(),
+                },
+              ];
+            });
+            break;
+          }
+
+          case 'TOOL_CALL': {
+            const streamId = msg.stream_id || 'default';
+            const tc: ToolCall = {
+              call_id: msg.call_id || '',
+              tool_name: msg.tool_name || '',
+              args: (msg.args || {}) as Record<string, unknown>,
+              stream_id: streamId,
+              seq: msg.seq,
+            };
+
+            setStreams((prev) => {
+              const next = new Map(prev);
+              const existing = next.get(streamId) || {
+                stream_id: streamId,
+                blocks: [],
+                isComplete: false,
+              };
+              const blocks: StreamBlock[] = [
+                ...existing.blocks,
+                {
+                  kind: 'tool-call',
+                  id: `tc-${msg.call_id}`,
+                  call: tc,
+                },
+              ];
+              next.set(streamId, { ...existing, blocks });
+              return next;
+            });
+
+            setTimeout(() => sendToolAck(msg.call_id || ''), 100);
+            break;
+          }
+
+          case 'TOOL_RESULT': {
+            const streamId = msg.stream_id || 'default';
+            setStreams((prev) => {
+              const next = new Map(prev);
+              const existing = next.get(streamId);
+              if (!existing) return next;
+              const blocks = existing.blocks.map((b) => {
+                if (
+                  b.kind === 'tool-call' &&
+                  b.call.call_id === msg.call_id &&
+                  msg.result !== undefined
+                ) {
+                  return {
+                    kind: 'tool-call' as const,
+                    id: b.id,
+                    call: { ...b.call, result: msg.result },
+                  };
+                }
+                return b;
+              });
+              next.set(streamId, { ...existing, blocks });
+              return next;
+            });
+            break;
+          }
+
+          case 'CONTEXT_SNAPSHOT':
+            setContexts((prev) => [
               ...prev,
               {
-                id: `agent-${streamId}-${Date.now()}`,
-                role: 'agent' as const,
-                content: msg.text || '',
-                streamId,
+                context_id: msg.context_id || '',
+                data: msg.data,
+                seq: msg.seq ?? 0,
                 timestamp: Date.now(),
               },
-            ];
-          });
-          break;
-        }
+            ]);
+            break;
 
-        case 'TOOL_CALL': {
-          const streamId = msg.stream_id || 'default';
-          const toolCall = {
-            call_id: msg.call_id || '',
-            tool_name: msg.tool_name || '',
-            args: (msg.args || {}) as Record<string, unknown>,
-            stream_id: streamId,
-            seq: msg.seq,
-          };
+          case 'PING':
+            sendPong(msg.challenge || '');
+            break;
 
-          setStreams((prev) => {
-            const next = new Map(prev);
-            const existing = next.get(streamId) || {
-              stream_id: streamId,
-              chunks: [{ id: `chunk-init-${streamId}`, text: '', stream_id: streamId }],
-              toolCalls: [],
-              isComplete: false,
-            };
-
-            const updatedChunks = [...existing.chunks];
-            const lastChunk = updatedChunks[updatedChunks.length - 1];
-
-            updatedChunks[updatedChunks.length - 1] = {
-              ...lastChunk,
-              beforeToolCallSeq: msg.seq,
-            };
-
-            updatedChunks.push({
-              id: `chunk-after-${msg.call_id}`,
-              text: '',
-              stream_id: streamId,
+          case 'STREAM_END': {
+            const streamId = msg.stream_id || 'default';
+            setStreams((prev) => {
+              const next = new Map(prev);
+              const existing = next.get(streamId);
+              if (existing) {
+                next.set(streamId, { ...existing, isComplete: true });
+              }
+              return next;
             });
+            break;
+          }
 
-            next.set(streamId, {
-              ...existing,
-              chunks: updatedChunks,
-              toolCalls: [...existing.toolCalls, toolCall],
-            });
-            return next;
-          });
-
-          setTimeout(() => sendToolAck(msg.call_id || ''), 100);
-          break;
+          case 'ERROR':
+            console.error('Server error:', msg.code, msg.message);
+            break;
         }
-
-        case 'TOOL_RESULT': {
-          const streamId = msg.stream_id || 'default';
-          setStreams((prev) => {
-            const next = new Map(prev);
-            const existing = next.get(streamId);
-            if (existing) {
-              next.set(streamId, {
-                ...existing,
-                toolCalls: existing.toolCalls.map((tc) =>
-                  tc.call_id === msg.call_id ? { ...tc, result: msg.result } : tc
-                ),
-              });
-            }
-            return next;
-          });
-          break;
-        }
-
-        case 'CONTEXT_SNAPSHOT':
-          setContexts((prev) => [
-            ...prev,
-            {
-              context_id: msg.context_id || '',
-              data: msg.data,
-              seq: msg.seq ?? 0,
-              timestamp: Date.now(),
-            },
-          ]);
-          break;
-
-        case 'PING':
-          sendPong(msg.challenge || '');
-          break;
-
-        case 'STREAM_END': {
-          const streamId = msg.stream_id || 'default';
-          setStreams((prev) => {
-            const next = new Map(prev);
-            const existing = next.get(streamId);
-            if (existing) {
-              next.set(streamId, { ...existing, isComplete: true });
-            }
-            return next;
-          });
-          break;
-        }
-
-        case 'ERROR':
-          console.error('Server error:', msg.code, msg.message);
-          break;
       }
     },
     [addTimelineEvent, sendPong, sendToolAck]
   );
 
-  const processMessageRef = useRef(processMessage);
-  const flushReorderBufferRef = useRef<() => void>(() => {});
+  const processMessagesRef = useRef(processMessages);
 
   useEffect(() => {
-    processMessageRef.current = processMessage;
-  }, [processMessage]);
-
-  const flushReorderBuffer = useCallback(() => {
-    const buffer = reorderBufferRef.current;
-    let expected = lastProcessedSeqRef.current + 1;
-
-    let found = true;
-    while (found) {
-      found = false;
-      for (let seq = expected; ; seq++) {
-        if (buffer.has(seq)) {
-          const msg = buffer.get(seq)!;
-          buffer.delete(seq);
-          processMessageRef.current(msg);
-          expected = seq + 1;
-          found = true;
-        } else {
-          break;
-        }
-      }
-    }
-  }, []);
-
-  useEffect(() => {
-    flushReorderBufferRef.current = flushReorderBuffer;
-  }, [flushReorderBuffer]);
+    processMessagesRef.current = processMessages;
+  }, [processMessages]);
 
   const handleMessage = useCallback((event: MessageEvent) => {
     try {
       const msg = JSON.parse(event.data) as ServerMessage;
-
-      if (msg.seq !== undefined && processedSeqsRef.current.has(msg.seq)) {
-        return;
-      }
+      const seqBuf = seqBufRef.current;
 
       if (msg.seq === undefined) {
-        processMessageRef.current(msg);
+        processMessagesRef.current([msg]);
         return;
       }
 
-      if (msg.seq === lastProcessedSeqRef.current + 1) {
-        processMessageRef.current(msg);
-        flushReorderBufferRef.current();
-      } else if (msg.seq > lastProcessedSeqRef.current + 1) {
-        reorderBufferRef.current.set(msg.seq, msg);
+      const toProcess = seqBuf.tryProcess(msg);
+      if (toProcess.length > 0) {
+        processMessagesRef.current(toProcess);
+        const maxSeq = toProcess.reduce(
+          (max, m) => (m.seq !== undefined && m.seq > max ? m.seq : max),
+          domConsumedSeqRef.current
+        );
+        domConsumedSeqRef.current = maxSeq;
       }
-    } catch (e) {
-      console.error('Failed to parse message:', e);
+    } catch {
+      console.error('Failed to parse message');
     }
   }, []);
-
-  const connectRef = useRef<() => void>(() => {});
 
   useEffect(() => {
     const connect = () => {
@@ -337,19 +319,18 @@ export function useAgentWebSocket(): UseAgentWebSocketReturn {
         setConnectionStatus('connected');
         reconnectDelayRef.current = INITIAL_RECONNECT_DELAY;
 
-        if (lastProcessedSeqRef.current > 0) {
+        const lastSeq = domConsumedSeqRef.current;
+        if (lastSeq > 0) {
           const resumeMsg: ClientMessage = {
             type: 'RESUME',
-            last_seq: lastProcessedSeqRef.current,
+            last_seq: lastSeq,
           };
           ws.send(JSON.stringify(resumeMsg));
           addTimelineEvent({
             type: 'RESUME',
-            content: `Resuming from seq ${lastProcessedSeqRef.current}`,
+            content: `Resuming from seq ${lastSeq}`,
           });
         }
-
-        flushReorderBufferRef.current();
       };
 
       ws.onmessage = handleMessage;
@@ -365,7 +346,7 @@ export function useAgentWebSocket(): UseAgentWebSocketReturn {
             reconnectDelayRef.current * 2,
             MAX_RECONNECT_DELAY
           );
-          connectRef.current();
+          connect();
         }, reconnectDelayRef.current);
       };
 
@@ -374,11 +355,7 @@ export function useAgentWebSocket(): UseAgentWebSocketReturn {
       };
     };
 
-    connectRef.current = connect;
-  }, [addTimelineEvent, handleMessage]);
-
-  useEffect(() => {
-    connectRef.current();
+    connect();
 
     return () => {
       if (reconnectTimerRef.current) {
@@ -386,7 +363,7 @@ export function useAgentWebSocket(): UseAgentWebSocketReturn {
       }
       wsRef.current?.close();
     };
-  }, []);
+  }, [addTimelineEvent, handleMessage]);
 
   const sendMessage = useCallback(
     (content: string) => {
