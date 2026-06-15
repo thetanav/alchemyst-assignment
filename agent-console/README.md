@@ -54,15 +54,10 @@ npm test
 
 ## Screenshots
 
-Take these screenshots with the agent-server running in **normal mode** and the app open at `http://localhost:3000`:
+Taken screenshots with the agent-server running in **normal mode** and the app open at `http://localhost:3000`:
 
-1. Send a message like "Summarise the Q3 report" — screenshot the chat panel showing a tool call card mid-stream
-2. Open the timeline panel — screenshot showing the filter bar, batch-grouped tokens, and linked TOOL_CALL / TOOL_RESULT rows
-3. After the response completes, click through context snapshots in the context inspector — screenshot showing the diff view
+<img width="1918" height="943" alt="image" src="https://github.com/user-attachments/assets/e89750ca-359d-410d-954f-c59f34c8e481" />
 
-| Streaming with Tool Call | Trace Timeline | Context Inspector |
-|---|---|---|
-| _(add screenshot)_ | _(add screenshot)_ | _(add screenshot)_ |
 
 ## State Machine
 
